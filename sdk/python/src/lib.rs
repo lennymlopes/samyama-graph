@@ -606,6 +606,36 @@ impl SamyamaClient {
         })
     }
 
+    /// Dump all vector indices to a directory.
+    ///
+    /// Embedded mode only. Writes one `.hnsw` file per index plus a
+    /// `metadata.json` listing dimensions and metric. The directory is
+    /// created if it does not exist. Use with `export_snapshot` to make
+    /// a full graph+index checkpoint that survives process restart.
+    #[pyo3(signature = (path))]
+    fn export_vectors(&self, path: &str) -> PyResult<()> {
+        let client = self.require_embedded()?;
+        let rt = get_runtime();
+        rt.block_on(client.export_vectors(std::path::Path::new(path)))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load all vector indices from a directory previously written by
+    /// `export_vectors`.
+    ///
+    /// Embedded mode only. Existing in-memory indices with the same
+    /// `(label, property_key)` are replaced. If `path` or
+    /// `path/metadata.json` is missing the call is a no-op.
+    #[pyo3(signature = (path))]
+    fn import_vectors(&self, path: &str) -> PyResult<()> {
+        let client = self.require_embedded()?;
+        let rt = get_runtime();
+        rt.block_on(client.import_vectors(std::path::Path::new(path)))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
     fn __repr__(&self) -> String {
         match &*self.inner {
             ClientInner::Embedded(_) => "SamyamaClient(mode='embedded')".to_string(),

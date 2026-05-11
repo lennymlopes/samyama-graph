@@ -136,6 +136,36 @@ impl EmbeddedClient {
         let stats = samyama::snapshot::import_tenant_with_dedup(&mut store_guard, reader, dedup_keys)?;
         Ok(stats)
     }
+
+    /// Dump all vector indices to a directory.
+    ///
+    /// Writes one `.hnsw` file per index plus a `metadata.json` listing
+    /// dimensions and metric for each. The directory is created if it
+    /// does not exist.
+    pub async fn export_vectors(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store_guard = self.store.read().await;
+        store_guard.vector_index.dump_all(path)?;
+        Ok(())
+    }
+
+    /// Load all vector indices from a directory previously written by
+    /// `export_vectors`.
+    ///
+    /// Existing in-memory indices with the same `(label, property_key)`
+    /// are replaced. If `path` or `path/metadata.json` does not exist
+    /// the call is a no-op (matches the underlying `VectorIndexManager`
+    /// behavior).
+    pub async fn import_vectors(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store_guard = self.store.read().await;
+        store_guard.vector_index.load_all(path)?;
+        Ok(())
+    }
 }
 
 impl Default for EmbeddedClient {
