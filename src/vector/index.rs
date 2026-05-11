@@ -87,23 +87,35 @@ pub struct CosineDistance;
 
 impl Distance<f32> for CosineDistance {
     fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
-        let mut dot = 0.0;
-        let mut norm_a = 0.0;
-        let mut norm_b = 0.0;
-        
+        // Accumulate in f64. Summing many f32 squares loses enough precision
+        // that, for near-identical unit vectors, the resulting similarity
+        // can exceed 1.0 by a few ULPs and produce a negative distance,
+        // which violates hnsw-rs's heap invariant `c.dist_to_ref <= 0.`
+        // and panics during search.
+        let mut dot: f64 = 0.0;
+        let mut norm_a: f64 = 0.0;
+        let mut norm_b: f64 = 0.0;
+
         for (a, b) in va.iter().zip(vb.iter()) {
+            let (a, b) = (*a as f64, *b as f64);
             dot += a * b;
             norm_a += a * a;
             norm_b += b * b;
         }
-        
+
         if norm_a <= 0.0 || norm_b <= 0.0 {
             return 1.0;
         }
-        
-        // Cosine distance = 1.0 - cosine similarity
-        let sim = dot / (norm_a.sqrt() * norm_b.sqrt());
-        1.0 - sim
+
+        let sim = dot / (norm_a * norm_b).sqrt();
+        let dist = 1.0 - sim;
+        if !dist.is_finite() {
+            // NaN from non-finite input components — clamp would propagate NaN
+            // (`NaN <= 0.` is false, so the hnsw assert would still fire).
+            return 1.0;
+        }
+        // Safety net: even with f64, treat any residual negative distance as 0.
+        dist.max(0.0) as f32
     }
 }
 
@@ -113,12 +125,19 @@ pub struct InnerProductDistance;
 
 impl Distance<f32> for InnerProductDistance {
     fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
-        let mut dot = 0.0;
+        // Same root cause as CosineDistance: f32 accumulation can let `dot`
+        // exceed 1.0 for near-identical normalized vectors, producing a
+        // negative distance that trips hnsw-rs's `c.dist_to_ref <= 0.`
+        // assert. Accumulate in f64 and clamp the result.
+        let mut dot: f64 = 0.0;
         for (a, b) in va.iter().zip(vb.iter()) {
-            dot += a * b;
+            dot += (*a as f64) * (*b as f64);
         }
-        // Inner product distance = 1.0 - dot product (for normalized vectors)
-        1.0 - dot
+        let dist = 1.0 - dot;
+        if !dist.is_finite() {
+            return 1.0;
+        }
+        dist.max(0.0) as f32
     }
 }
 
@@ -332,5 +351,46 @@ mod tests {
         let inner = InnerProductDistance;
         // Dot product = 0
         assert!((inner.eval(&v1, &v2) - 1.0).abs() < 1e-6); // 1.0 - 0.0
+    }
+
+    #[test]
+    fn test_cosine_distance_nonnegative_on_near_identical() {
+        // Regression: near-identical unit vectors used to yield ~-1.19e-7 with
+        // f32 accumulation (sim drifted just above 1.0), violating hnsw-rs's
+        // heap invariant `c.dist_to_ref <= 0.` and panicking during search.
+        let cosine = CosineDistance;
+        let a = vec![0.57735026, 0.57735026, 0.57735026];
+        let b = vec![0.57735027, 0.57735027, 0.57735027];
+        let d = cosine.eval(&a, &b);
+        assert!(d >= 0.0, "distance must be >= 0, got {}", d);
+        assert!(d <= 1.0, "distance must be <= 1, got {}", d);
+        // With f64 accumulation the result is effectively 0 (well below the
+        // f32 round-off noise that would have produced the panic).
+        assert!(d < 1e-6, "distance must be ~0, got {}", d);
+    }
+
+    #[test]
+    fn test_cosine_distance_nan_safe() {
+        // NaN inputs must not propagate to the returned distance — the hnsw
+        // assert is `c.dist_to_ref <= 0.`, which is false for NaN and would
+        // still panic.
+        let cosine = CosineDistance;
+        let a = vec![f32::NAN, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let d = cosine.eval(&a, &b);
+        assert!(d.is_finite(), "distance must be finite on NaN input, got {}", d);
+        assert!(d >= 0.0 && d <= 1.0, "distance must be in [0,1] on NaN input, got {}", d);
+    }
+
+    #[test]
+    fn test_inner_product_distance_nonnegative_on_near_identical() {
+        // Same FP-overshoot regression as CosineDistance: near-identical
+        // normalized vectors could yield `1.0 - dot < 0` in f32 and panic.
+        let ip = InnerProductDistance;
+        let a = vec![0.57735026, 0.57735026, 0.57735026];
+        let b = vec![0.57735027, 0.57735027, 0.57735027];
+        let d = ip.eval(&a, &b);
+        assert!(d >= 0.0, "distance must be >= 0, got {}", d);
+        assert!(d <= 1.0, "distance must be <= 1, got {}", d);
     }
 }
