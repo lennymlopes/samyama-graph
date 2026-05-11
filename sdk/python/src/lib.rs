@@ -86,6 +86,58 @@ impl ServerStatus {
     }
 }
 
+/// Stats returned from `SamyamaClient.export_snapshot`.
+#[pyclass]
+#[derive(Clone)]
+struct ExportStats {
+    #[pyo3(get)]
+    node_count: u64,
+    #[pyo3(get)]
+    edge_count: u64,
+    #[pyo3(get)]
+    labels: Vec<String>,
+    #[pyo3(get)]
+    edge_types: Vec<String>,
+    #[pyo3(get)]
+    bytes_written: u64,
+}
+
+#[pymethods]
+impl ExportStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "ExportStats(nodes={}, edges={}, bytes={})",
+            self.node_count, self.edge_count, self.bytes_written
+        )
+    }
+}
+
+/// Stats returned from `SamyamaClient.import_snapshot`.
+#[pyclass]
+#[derive(Clone)]
+struct ImportStats {
+    #[pyo3(get)]
+    node_count: u64,
+    #[pyo3(get)]
+    edge_count: u64,
+    #[pyo3(get)]
+    merged_count: u64,
+    #[pyo3(get)]
+    labels: Vec<String>,
+    #[pyo3(get)]
+    edge_types: Vec<String>,
+}
+
+#[pymethods]
+impl ImportStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "ImportStats(nodes={}, edges={}, merged={})",
+            self.node_count, self.edge_count, self.merged_count
+        )
+    }
+}
+
 /// Convert SDK QueryResult to Python QueryResult
 fn convert_query_result(result: SdkQueryResult) -> PyResult<QueryResult> {
     let nodes_json: Vec<serde_json::Value> = result.nodes.iter().map(|n| {
@@ -480,6 +532,79 @@ impl SamyamaClient {
         Ok(results.into_iter().map(|(nid, dist)| (nid.0, dist)).collect())
     }
 
+    // ========================================================================
+    // Snapshot persistence (embedded mode only)
+    // ========================================================================
+
+    /// Export the current graph store to a `.sgsnap` snapshot file.
+    ///
+    /// Embedded mode only. Use this to checkpoint an in-memory session to
+    /// disk; reload later with `import_snapshot()`.
+    fn export_snapshot(&self, path: &str) -> PyResult<ExportStats> {
+        let client = self.require_embedded()?;
+        let rt = get_runtime();
+        // The Rust callee currently ignores the tenant argument (single-tenant
+        // embedded mode). Pass the default name so behavior is well-defined
+        // if tenancy is wired through later.
+        let stats = rt
+            .block_on(client.export_snapshot("default", std::path::Path::new(path)))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(ExportStats {
+            node_count: stats.node_count,
+            edge_count: stats.edge_count,
+            labels: stats.labels,
+            edge_types: stats.edge_types,
+            bytes_written: stats.bytes_written,
+        })
+    }
+
+    /// Import a `.sgsnap` snapshot file into the current graph store.
+    ///
+    /// Embedded mode only. Appends to the in-memory graph; create a fresh
+    /// client first if you want a clean load.
+    fn import_snapshot(&self, path: &str) -> PyResult<ImportStats> {
+        let client = self.require_embedded()?;
+        let rt = get_runtime();
+        let stats = rt
+            .block_on(client.import_snapshot("default", std::path::Path::new(path)))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(ImportStats {
+            node_count: stats.node_count,
+            edge_count: stats.edge_count,
+            merged_count: stats.merged_count,
+            labels: stats.labels,
+            edge_types: stats.edge_types,
+        })
+    }
+
+    /// Import a `.sgsnap` snapshot with property-based deduplication.
+    ///
+    /// `dedup_keys` lists node property names used to merge duplicates across
+    /// snapshots (e.g. `["iso_code", "drugbank_id"]`). Embedded mode only.
+    fn import_snapshot_dedup(
+        &self,
+        path: &str,
+        dedup_keys: Vec<String>,
+    ) -> PyResult<ImportStats> {
+        let client = self.require_embedded()?;
+        let rt = get_runtime();
+        let key_refs: Vec<&str> = dedup_keys.iter().map(|s| s.as_str()).collect();
+        let stats = rt
+            .block_on(client.import_snapshot_dedup(
+                "default",
+                std::path::Path::new(path),
+                &key_refs,
+            ))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(ImportStats {
+            node_count: stats.node_count,
+            edge_count: stats.edge_count,
+            merged_count: stats.merged_count,
+            labels: stats.labels,
+            edge_types: stats.edge_types,
+        })
+    }
+
     fn __repr__(&self) -> String {
         match &*self.inner {
             ClientInner::Embedded(_) => "SamyamaClient(mode='embedded')".to_string(),
@@ -494,5 +619,7 @@ fn samyama(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SamyamaClient>()?;
     m.add_class::<QueryResult>()?;
     m.add_class::<ServerStatus>()?;
+    m.add_class::<ExportStats>()?;
+    m.add_class::<ImportStats>()?;
     Ok(())
 }
