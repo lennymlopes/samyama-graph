@@ -103,7 +103,11 @@ impl Distance<f32> for CosineDistance {
         
         // Cosine distance = 1.0 - cosine similarity
         let sim = dot / (norm_a.sqrt() * norm_b.sqrt());
-        1.0 - sim
+        // Clamp similarity to [-1, 1] to handle FP precision errors where sim may exceed bounds.
+        // This prevents negative distances that cause HNSW search panics:
+        // "assertion failed: {c,f}.dist_to_ref {<=,>=} 0"
+        let clamped_sim = sim.clamp(-1.0, 1.0);
+        1.0 - clamped_sim
     }
 }
 
