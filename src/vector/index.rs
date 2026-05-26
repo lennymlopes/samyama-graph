@@ -148,14 +148,75 @@ pub struct StoredVector {
     pub vector: Vec<f32>,
 }
 
+/// Runtime dispatch over the HNSW distance type.
+///
+/// `Hnsw<'_, f32, D>` is generic over its distance impl, so each metric is
+/// a distinct monomorphization. To pick the metric at runtime we wrap the
+/// three concrete instantiations in this enum and dispatch via match.
+enum HnswIndex {
+    Cosine(Hnsw<'static, f32, CosineDistance>),
+    L2(Hnsw<'static, f32, DistL2>),
+    InnerProduct(Hnsw<'static, f32, InnerProductDistance>),
+}
+
+impl HnswIndex {
+    fn new(
+        metric: DistanceMetric,
+        m: usize,
+        max_elements: usize,
+        max_layer: usize,
+        ef_construction: usize,
+    ) -> Self {
+        match metric {
+            DistanceMetric::Cosine => Self::Cosine(Hnsw::new(
+                m,
+                max_elements,
+                max_layer,
+                ef_construction,
+                CosineDistance,
+            )),
+            DistanceMetric::L2 => Self::L2(Hnsw::new(
+                m,
+                max_elements,
+                max_layer,
+                ef_construction,
+                DistL2,
+            )),
+            DistanceMetric::InnerProduct => Self::InnerProduct(Hnsw::new(
+                m,
+                max_elements,
+                max_layer,
+                ef_construction,
+                InnerProductDistance,
+            )),
+        }
+    }
+
+    fn insert(&self, point: (&Vec<f32>, usize)) {
+        match self {
+            Self::Cosine(h) => h.insert(point),
+            Self::L2(h) => h.insert(point),
+            Self::InnerProduct(h) => h.insert(point),
+        }
+    }
+
+    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<Neighbour> {
+        match self {
+            Self::Cosine(h) => h.search(query, k, ef_search),
+            Self::L2(h) => h.search(query, k, ef_search),
+            Self::InnerProduct(h) => h.search(query, k, ef_search),
+        }
+    }
+}
+
 /// Wrapper around HNSW index
 pub struct VectorIndex {
     /// Number of dimensions
     dimensions: usize,
     /// Distance metric
     metric: DistanceMetric,
-    /// The actual HNSW index
-    hnsw: Hnsw<'static, f32, CosineDistance>,
+    /// The actual HNSW index (variant-dispatched by `metric`)
+    hnsw: HnswIndex,
     /// All inserted vectors (for persistence — HNSW doesn't expose iteration)
     stored_vectors: Vec<StoredVector>,
 }
@@ -178,7 +239,7 @@ impl VectorIndex {
         let m = 16;
         let ef_construction = 200;
 
-        let hnsw = Hnsw::new(m, max_elements, 16, ef_construction, CosineDistance);
+        let hnsw = HnswIndex::new(metric, m, max_elements, 16, ef_construction);
 
         Self {
             dimensions,
@@ -275,7 +336,7 @@ impl VectorIndex {
         let max_elements = (stored_vectors.len() + 10_000).max(100_000);
         let m = 16;
         let ef_construction = 200;
-        let mut hnsw = Hnsw::new(m, max_elements, 16, ef_construction, CosineDistance);
+        let hnsw = HnswIndex::new(metric, m, max_elements, 16, ef_construction);
 
         // Re-insert all vectors
         for sv in &stored_vectors {
@@ -393,4 +454,67 @@ mod tests {
         assert!(d >= 0.0, "distance must be >= 0, got {}", d);
         assert!(d <= 1.0, "distance must be <= 1, got {}", d);
     }
+
+    #[test]
+    fn test_vector_index_l2_metric_honored() {
+        // Vectors with the same direction but very different magnitudes:
+        // cosine ranks them as near-equal, L2 ranks the closer-magnitude
+        // one much higher. A previous bug hardcoded CosineDistance on
+        // every VectorIndex regardless of the metric argument, so this
+        // assertion would have failed against an L2 index returning
+        // cosine distances.
+        let mut idx = VectorIndex::new(2, DistanceMetric::L2);
+        idx.add(NodeId::new(1), &vec![1.0, 0.0]).unwrap();
+        idx.add(NodeId::new(2), &vec![100.0, 0.0]).unwrap();
+
+        let results = idx.search(&[1.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        // Distances must reflect L2 geometry: ~0 to (1,0), ~99 to (100,0).
+        let by_id: std::collections::HashMap<NodeId, f32> =
+            results.into_iter().collect();
+        assert!(by_id[&NodeId::new(1)] < 1.0, "L2 dist to (1,0) should be ~0");
+        assert!(by_id[&NodeId::new(2)] > 90.0, "L2 dist to (100,0) should be ~99");
+    }
+
+    #[test]
+    fn test_vector_index_inner_product_metric_honored() {
+        // Inner-product favors high-magnitude alignment with the query;
+        // cosine treats both vectors as parallel to (1,0). Safe to exercise
+        // because the f64-hardened `InnerProductDistance` (earlier in this
+        // file) clamps any FP-overshoot to a non-negative distance.
+        let mut idx = VectorIndex::new(2, DistanceMetric::InnerProduct);
+        idx.add(NodeId::new(1), &vec![1.0, 0.0]).unwrap();
+        idx.add(NodeId::new(2), &vec![100.0, 0.0]).unwrap();
+
+        let results = idx.search(&[1.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        let by_id: std::collections::HashMap<NodeId, f32> =
+            results.into_iter().collect();
+        // Larger magnitude → higher dot → lower (clamped) distance.
+        assert!(by_id[&NodeId::new(2)] <= by_id[&NodeId::new(1)]);
+    }
+
+    #[test]
+    fn test_vector_index_l2_persistence_round_trip() {
+        // Regression: dump and load must preserve the chosen metric and
+        // produce a queryable index. (See test_vector_index_persistence
+        // for the larger persistence test — this one specifically pins
+        // the metric round-trip behavior.)
+        let dir = tempfile::TempDir::new().unwrap();
+        let dump_path = dir.path().join("vec.bin");
+
+        let mut idx = VectorIndex::new(2, DistanceMetric::L2);
+        idx.add(NodeId::new(1), &vec![1.0, 0.0]).unwrap();
+        idx.add(NodeId::new(2), &vec![100.0, 0.0]).unwrap();
+        idx.dump(&dump_path).unwrap();
+
+        let loaded = VectorIndex::load(&dump_path, 2, DistanceMetric::L2).unwrap();
+        assert_eq!(loaded.metric(), DistanceMetric::L2);
+        let results = loaded.search(&[1.0, 0.0], 2).unwrap();
+        let by_id: std::collections::HashMap<NodeId, f32> =
+            results.into_iter().collect();
+        assert!(by_id[&NodeId::new(1)] < 1.0);
+        assert!(by_id[&NodeId::new(2)] > 90.0);
+    }
 }
+
